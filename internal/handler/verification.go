@@ -1,0 +1,279 @@
+package handler
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type VerificationHandler struct{ db *pgxpool.Pool }
+
+func NewVerificationHandler(db *pgxpool.Pool) *VerificationHandler {
+	return &VerificationHandler{db: db}
+}
+
+type verificationRequest struct {
+	ID            string        `json:"id"`
+	UserID        string        `json:"user_id"`
+	RequestedRole string        `json:"requested_role"`
+	Comment       string        `json:"comment"`
+	Status        string        `json:"status"`
+	ReviewedBy    *string       `json:"reviewed_by"`
+	ReviewedAt    *time.Time    `json:"reviewed_at"`
+	CreatedAt     time.Time     `json:"created_at"`
+	UpdatedAt     time.Time     `json:"updated_at"`
+	Profile       *verProfile   `json:"profile,omitempty"`
+	Documents     []verDocument `json:"documents,omitempty"`
+}
+
+type verProfile struct {
+	FullName    string `json:"full_name"`
+	Email       string `json:"email"`
+	Phone       string `json:"phone"`
+	IIN         string `json:"iin"`
+	FullAddress string `json:"full_address"`
+}
+
+type verDocument struct {
+	ID       string `json:"id"`
+	FilePath string `json:"file_path"`
+	FileName string `json:"file_name"`
+	FileSize int64  `json:"file_size"`
+	URL      string `json:"url"`
+}
+
+type submitVerificationReq struct {
+	RequestedRole string `json:"requested_role" binding:"required"`
+	Comment       string `json:"comment"`
+}
+
+func (h *VerificationHandler) Submit(c *gin.Context) {
+	var req submitVerificationReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	userID := c.GetString("user_id")
+	id := uuid.New().String()
+	ctx := context.Background()
+
+	_, err := h.db.Exec(ctx, `
+		INSERT INTO verification_requests
+			(id, user_id, requested_role, comment, status)
+		VALUES ($1, $2, $3, $4, 'pending')`,
+		id, userID, req.RequestedRole, req.Comment,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		return
+	}
+
+	_, _ = h.db.Exec(ctx,
+		`UPDATE profiles SET verification_status = 'pending', updated_at = NOW() WHERE id = $1`,
+		userID)
+
+	c.JSON(http.StatusCreated, gin.H{"id": id})
+}
+
+func (h *VerificationHandler) UploadDocuments(c *gin.Context) {
+	verID := c.Param("id")
+	userID := c.GetString("user_id")
+	ctx := context.Background()
+
+	form, err := c.MultipartForm()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "multipart form required"})
+		return
+	}
+
+	files := form.File["documents"]
+	if len(files) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one document required"})
+		return
+	}
+
+	baseURL := os.Getenv("BASE_URL")
+	dir := filepath.Join("uploads", "verification-docs", userID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		return
+	}
+
+	uploaded := []string{}
+	for _, fh := range files {
+		ext := filepath.Ext(fh.Filename)
+		filename := fmt.Sprintf("%d_%s%s", time.Now().UnixMilli(), uuid.New().String()[:8], ext)
+		savePath := filepath.Join(dir, filename)
+
+		if err := c.SaveUploadedFile(fh, savePath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save file"})
+			return
+		}
+
+		_, err = h.db.Exec(ctx, `
+			INSERT INTO verification_documents
+				(id, verification_request_id, file_path, file_name, file_size)
+			VALUES ($1, $2, $3, $4, $5)`,
+			uuid.New().String(), verID, savePath, fh.Filename, fh.Size,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+			return
+		}
+		uploaded = append(uploaded,
+			fmt.Sprintf("%s/uploads/verification-docs/%s/%s", baseURL, userID, filename))
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"uploaded": uploaded})
+}
+
+func (h *VerificationHandler) List(c *gin.Context) {
+	role := c.GetString("user_role")
+	userID := c.GetString("user_id")
+	ctx := context.Background()
+	baseURL := os.Getenv("BASE_URL")
+
+	var rows interface {
+		Next() bool
+		Scan(...any) error
+		Close()
+		Err() error
+	}
+	var err error
+
+	if role == "admin" {
+		rows, err = h.db.Query(ctx, `
+			SELECT vr.id, vr.user_id, vr.requested_role, vr.comment, vr.status,
+			       vr.reviewed_by, vr.reviewed_at, vr.created_at, vr.updated_at,
+			       COALESCE(p.full_name,''), COALESCE(p.email,''),
+			       COALESCE(p.phone,''), COALESCE(p.iin,''), COALESCE(p.full_address,'')
+			FROM verification_requests vr
+			LEFT JOIN profiles p ON p.id = vr.user_id
+			ORDER BY vr.created_at DESC`)
+	} else {
+		rows, err = h.db.Query(ctx, `
+			SELECT vr.id, vr.user_id, vr.requested_role, vr.comment, vr.status,
+			       vr.reviewed_by, vr.reviewed_at, vr.created_at, vr.updated_at,
+			       COALESCE(p.full_name,''), COALESCE(p.email,''),
+			       COALESCE(p.phone,''), COALESCE(p.iin,''), COALESCE(p.full_address,'')
+			FROM verification_requests vr
+			LEFT JOIN profiles p ON p.id = vr.user_id
+			WHERE vr.user_id = $1
+			ORDER BY vr.created_at DESC`, userID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		return
+	}
+	defer rows.Close()
+
+	result := []verificationRequest{}
+	idIndex := map[string]int{}
+
+	for rows.Next() {
+		var r verificationRequest
+		var prof verProfile
+		if err := rows.Scan(
+			&r.ID, &r.UserID, &r.RequestedRole, &r.Comment, &r.Status,
+			&r.ReviewedBy, &r.ReviewedAt, &r.CreatedAt, &r.UpdatedAt,
+			&prof.FullName, &prof.Email, &prof.Phone, &prof.IIN, &prof.FullAddress,
+		); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+			return
+		}
+		r.Profile = &prof
+		r.Documents = []verDocument{}
+		idIndex[r.ID] = len(result)
+		result = append(result, r)
+	}
+
+	if len(result) > 0 {
+		ids := make([]string, len(result))
+		for i, r := range result {
+			ids[i] = r.ID
+		}
+		docRows, err := h.db.Query(ctx,
+			`SELECT id, verification_request_id, file_path, file_name, file_size
+			 FROM verification_documents WHERE verification_request_id = ANY($1)`, ids)
+		if err == nil {
+			defer docRows.Close()
+			for docRows.Next() {
+				var d verDocument
+				var reqID string
+				if err := docRows.Scan(&d.ID, &reqID, &d.FilePath, &d.FileName, &d.FileSize); err == nil {
+					d.URL = fmt.Sprintf("%s/uploads/verification-docs/%s", baseURL,
+						filepath.Base(d.FilePath))
+					if i, ok := idIndex[reqID]; ok {
+						result[i].Documents = append(result[i].Documents, d)
+					}
+				}
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+type updateVerStatusReq struct {
+	Status string `json:"status" binding:"required"`
+}
+
+func (h *VerificationHandler) UpdateStatus(c *gin.Context) {
+	if c.GetString("user_role") != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "admin only"})
+		return
+	}
+
+	id := c.Param("id")
+	var req updateVerStatusReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	allowed := map[string]bool{"approved": true, "rejected": true, "pending": true}
+	if !allowed[req.Status] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status"})
+		return
+	}
+
+	reviewerID := c.GetString("user_id")
+	ctx := context.Background()
+
+	var targetUserID string
+	err := h.db.QueryRow(ctx,
+		`UPDATE verification_requests
+		 SET status = $2, reviewed_by = $3, reviewed_at = NOW(), updated_at = NOW()
+		 WHERE id = $1
+		 RETURNING user_id`, id, req.Status, reviewerID,
+	).Scan(&targetUserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		return
+	}
+
+	if req.Status == "approved" {
+		var requestedRole string
+		_ = h.db.QueryRow(ctx,
+			`SELECT requested_role FROM verification_requests WHERE id = $1`, id,
+		).Scan(&requestedRole)
+
+		_, _ = h.db.Exec(ctx,
+			`UPDATE profiles SET role = $2, verification_status = 'approved', updated_at = NOW()
+			 WHERE id = $1`, targetUserID, requestedRole)
+	} else if req.Status == "rejected" {
+		_, _ = h.db.Exec(ctx,
+			`UPDATE profiles SET verification_status = 'rejected', updated_at = NOW()
+			 WHERE id = $1`, targetUserID)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": req.Status})
+}
