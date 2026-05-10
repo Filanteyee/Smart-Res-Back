@@ -32,6 +32,9 @@ type registerReq struct {
 	PropertyType   string `json:"property_type"`
 	PropertyNumber string `json:"property_number"`
 	FullAddress    string `json:"full_address"`
+	Entrance       *int   `json:"entrance"`
+	Floor          *int   `json:"floor"`
+	Apartment      string `json:"apartment"`
 }
 
 func (h *AuthHandler) Register(c *gin.Context) {
@@ -67,10 +70,12 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		INSERT INTO profiles (
 			id, full_name, email, phone, iin, person_type,
 			city, street, property_type, property_number, full_address,
+			entrance, floor, apartment,
 			role, verification_status
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'resident','not_submitted')`,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'resident','not_submitted')`,
 		userID, req.FullName, req.Email, req.Phone, req.IIN, req.PersonType,
 		req.City, req.Street, req.PropertyType, req.PropertyNumber, req.FullAddress,
+		req.Entrance, req.Floor, req.Apartment,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})

@@ -1,0 +1,13 @@
+.env
+secrets/
+*.json
+!go.sum
+uploads/
+desktop.ini
+
+server
+server.exe
+*.exe
+
+.idea/
+.vscode/

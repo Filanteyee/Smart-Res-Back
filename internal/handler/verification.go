@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +26,9 @@ type verificationRequest struct {
 	RequestedRole string        `json:"requested_role"`
 	Comment       string        `json:"comment"`
 	Status        string        `json:"status"`
+	Entrance      *int          `json:"entrance"`
+	Floor         *int          `json:"floor"`
+	Apartment     *string       `json:"apartment"`
 	ReviewedBy    *string       `json:"reviewed_by"`
 	ReviewedAt    *time.Time    `json:"reviewed_at"`
 	CreatedAt     time.Time     `json:"created_at"`
@@ -52,6 +56,9 @@ type verDocument struct {
 type submitVerificationReq struct {
 	RequestedRole string `json:"requested_role" binding:"required"`
 	Comment       string `json:"comment"`
+	Entrance      *int   `json:"entrance"`
+	Floor         *int   `json:"floor"`
+	Apartment     *int   `json:"apartment"`
 }
 
 func (h *VerificationHandler) Submit(c *gin.Context) {
@@ -65,11 +72,18 @@ func (h *VerificationHandler) Submit(c *gin.Context) {
 	id := uuid.New().String()
 	ctx := context.Background()
 
+	var apartmentStr *string
+	if req.Apartment != nil {
+		s := strconv.Itoa(*req.Apartment)
+		apartmentStr = &s
+	}
+
 	_, err := h.db.Exec(ctx, `
 		INSERT INTO verification_requests
-			(id, user_id, requested_role, comment, status)
-		VALUES ($1, $2, $3, $4, 'pending')`,
+			(id, user_id, requested_role, comment, status, entrance, floor, apartment)
+		VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)`,
 		id, userID, req.RequestedRole, req.Comment,
+		req.Entrance, req.Floor, apartmentStr,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
@@ -152,6 +166,7 @@ func (h *VerificationHandler) List(c *gin.Context) {
 	if role == "admin" {
 		rows, err = h.db.Query(ctx, `
 			SELECT vr.id, vr.user_id, vr.requested_role, vr.comment, vr.status,
+			       vr.entrance, vr.floor, vr.apartment,
 			       vr.reviewed_by, vr.reviewed_at, vr.created_at, vr.updated_at,
 			       COALESCE(p.full_name,''), COALESCE(p.email,''),
 			       COALESCE(p.phone,''), COALESCE(p.iin,''), COALESCE(p.full_address,'')
@@ -161,6 +176,7 @@ func (h *VerificationHandler) List(c *gin.Context) {
 	} else {
 		rows, err = h.db.Query(ctx, `
 			SELECT vr.id, vr.user_id, vr.requested_role, vr.comment, vr.status,
+			       vr.entrance, vr.floor, vr.apartment,
 			       vr.reviewed_by, vr.reviewed_at, vr.created_at, vr.updated_at,
 			       COALESCE(p.full_name,''), COALESCE(p.email,''),
 			       COALESCE(p.phone,''), COALESCE(p.iin,''), COALESCE(p.full_address,'')
@@ -183,6 +199,7 @@ func (h *VerificationHandler) List(c *gin.Context) {
 		var prof verProfile
 		if err := rows.Scan(
 			&r.ID, &r.UserID, &r.RequestedRole, &r.Comment, &r.Status,
+			&r.Entrance, &r.Floor, &r.Apartment,
 			&r.ReviewedBy, &r.ReviewedAt, &r.CreatedAt, &r.UpdatedAt,
 			&prof.FullName, &prof.Email, &prof.Phone, &prof.IIN, &prof.FullAddress,
 		); err != nil {
@@ -261,14 +278,16 @@ func (h *VerificationHandler) UpdateStatus(c *gin.Context) {
 	}
 
 	if req.Status == "approved" {
-		var requestedRole string
-		_ = h.db.QueryRow(ctx,
-			`SELECT requested_role FROM verification_requests WHERE id = $1`, id,
-		).Scan(&requestedRole)
-
-		_, _ = h.db.Exec(ctx,
-			`UPDATE profiles SET role = $2, verification_status = 'approved', updated_at = NOW()
-			 WHERE id = $1`, targetUserID, requestedRole)
+		_, _ = h.db.Exec(ctx, `
+			UPDATE profiles p SET
+				role                = vr.requested_role,
+				verification_status = 'approved',
+				entrance            = COALESCE(vr.entrance,  p.entrance),
+				floor               = COALESCE(vr.floor,     p.floor),
+				apartment           = COALESCE(vr.apartment, p.apartment),
+				updated_at          = NOW()
+			FROM verification_requests vr
+			WHERE vr.id = $1 AND p.id = vr.user_id`, id)
 	} else if req.Status == "rejected" {
 		_, _ = h.db.Exec(ctx,
 			`UPDATE profiles SET verification_status = 'rejected', updated_at = NOW()

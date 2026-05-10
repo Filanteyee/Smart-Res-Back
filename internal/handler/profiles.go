@@ -40,6 +40,9 @@ type updateProfileReq struct {
 	PropertyType   *string `json:"property_type"`
 	PropertyNumber *string `json:"property_number"`
 	FullAddress    *string `json:"full_address"`
+	Entrance       *int    `json:"entrance"`
+	Floor          *int    `json:"floor"`
+	Apartment      *string `json:"apartment"`
 }
 
 func (h *ProfileHandler) Update(c *gin.Context) {
@@ -68,11 +71,15 @@ func (h *ProfileHandler) Update(c *gin.Context) {
 			property_type   = COALESCE($6, property_type),
 			property_number = COALESCE($7, property_number),
 			full_address    = COALESCE($8, full_address),
+			entrance        = COALESCE($9, entrance),
+			floor           = COALESCE($10, floor),
+			apartment       = COALESCE($11, apartment),
 			updated_at      = NOW()
 		WHERE id = $1`,
 		id,
 		req.FullName, req.Phone, req.City, req.Street,
 		req.PropertyType, req.PropertyNumber, req.FullAddress,
+		req.Entrance, req.Floor, req.Apartment,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
