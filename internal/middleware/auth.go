@@ -17,14 +17,18 @@ type Claims struct {
 
 func Auth(secret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		header := c.GetHeader("Authorization")
-		if !strings.HasPrefix(header, "Bearer ") {
+		raw := ""
+		if h := c.GetHeader("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			raw = strings.TrimPrefix(h, "Bearer ")
+		} else if q := c.Query("token"); q != "" {
+			// EventSource (SSE) cannot set headers — accept token in query.
+			raw = q
+		}
+		if raw == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 			return
 		}
-		token, err := jwt.ParseWithClaims(
-			strings.TrimPrefix(header, "Bearer "),
-			&Claims{},
+		token, err := jwt.ParseWithClaims(raw, &Claims{},
 			func(t *jwt.Token) (any, error) { return []byte(secret), nil },
 		)
 		if err != nil || !token.Valid {

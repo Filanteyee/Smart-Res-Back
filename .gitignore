@@ -5,8 +5,8 @@ secrets/
 uploads/
 desktop.ini
 
-server
-server.exe
+/server
+/server.exe
 *.exe
 
 .idea/

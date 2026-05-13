@@ -109,6 +109,72 @@ func (s *Sender) NotifyEvent(ctx context.Context, eventID string) (int, error) {
 	return resp.SuccessCount, nil
 }
 
+// NotifyOffline alerts every approved admin (across all entrances) that a
+// sensor stopped responding. Used by the OFFLINE sweeper goroutine.
+func (s *Sender) NotifyOffline(ctx context.Context, sensorID, sensorType string, entrance, floor int) (int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT t.token FROM fcm_tokens t
+		JOIN profiles p ON p.id = t.user_id
+		WHERE p.role = 'admin' AND p.verification_status = 'approved'`)
+	if err != nil {
+		return 0, fmt.Errorf("load admin tokens: %w", err)
+	}
+	defer rows.Close()
+
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err == nil {
+			tokens = append(tokens, t)
+		}
+	}
+	if len(tokens) == 0 {
+		log.Printf("[fcm] offline %s: no admin tokens", sensorID)
+		return 0, nil
+	}
+
+	kind := "Водяной датчик"
+	if sensorType == "SMOKE" {
+		kind = "Датчик дыма"
+	}
+	title := "Датчик не на связи"
+	body := fmt.Sprintf("%s %d/%d не отвечает >60 сек", kind, entrance, floor)
+
+	data := map[string]string{
+		"kind":         "sensor_offline",
+		"sensor_id":    sensorID,
+		"sensor_type":  sensorType,
+		"entrance_num": fmt.Sprintf("%d", entrance),
+		"floor":        fmt.Sprintf("%d", floor),
+		"title":        title,
+		"body":         body,
+	}
+
+	multicast := &messaging.MulticastMessage{
+		Tokens:  tokens,
+		Data:    data,
+		Android: &messaging.AndroidConfig{Priority: "high"},
+	}
+
+	resp, err := s.messaging.SendEachForMulticast(ctx, multicast)
+	if err != nil {
+		return 0, fmt.Errorf("send offline: %w", err)
+	}
+	log.Printf("[fcm] offline %s: success=%d failure=%d", sensorID, resp.SuccessCount, resp.FailureCount)
+
+	if resp.FailureCount > 0 {
+		for i, r := range resp.Responses {
+			if r.Success {
+				continue
+			}
+			if messaging.IsRegistrationTokenNotRegistered(r.Error) || messaging.IsUnregistered(r.Error) {
+				_, _ = s.db.Exec(ctx, `DELETE FROM fcm_tokens WHERE token = $1`, tokens[i])
+			}
+		}
+	}
+	return resp.SuccessCount, nil
+}
+
 func messageFor(typ, status, threat string, entrance, floor int) (string, string) {
 	isFire := typ == "SMOKE" || threat == "FIRE"
 	isWater := typ == "WATER" || threat == "WATER_LEAK"

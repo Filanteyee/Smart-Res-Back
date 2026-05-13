@@ -29,10 +29,10 @@ func Seed(ctx context.Context, pool *pgxpool.Pool) error {
 			for _, t := range sensorTypes {
 				id := fmt.Sprintf("%s-%d-%d", t.prefix, e, f)
 				_, err := pool.Exec(ctx, `
-					INSERT INTO sensors (id, type, entrance_num, floor, status, last_updated)
-					VALUES ($1, $2, $3, $4, 'NORMAL', NOW())
+					INSERT INTO sensors (id, type, entrance_num, floor, status, last_updated, last_seen_at)
+					VALUES ($1, $2, $3, $4, 'NORMAL', NOW(), NOW())
 					ON CONFLICT (id) DO UPDATE
-					SET status = 'NORMAL', last_updated = NOW()`,
+					SET status = 'NORMAL', last_updated = NOW(), last_seen_at = NOW()`,
 					id, t.kind, e, f,
 				)
 				if err != nil {

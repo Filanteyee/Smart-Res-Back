@@ -15,6 +15,7 @@ import (
 	"smartresidency/internal/middleware"
 	"smartresidency/internal/mqtt"
 	"smartresidency/internal/sensors"
+	"smartresidency/internal/sse"
 )
 
 func main() {
@@ -36,6 +37,7 @@ func main() {
 
 	var notifier handler.EventNotifier
 	var mqttNotifier mqtt.Notifier
+	var offlineNotifier sensors.OfflineNotifier
 	if credPath := os.Getenv("FIREBASE_CREDENTIALS_PATH"); credPath != "" {
 		s, err := fcm.New(ctx, credPath, pool)
 		if err != nil {
@@ -43,12 +45,18 @@ func main() {
 		} else {
 			notifier = s
 			mqttNotifier = s
+			offlineNotifier = s
 			log.Println("fcm initialized")
 		}
 	} else {
 		log.Println("FIREBASE_CREDENTIALS_PATH not set — push disabled")
 	}
 
+	hub := sse.NewHub()
+
+	go sensors.NewOfflineSweeper(pool, offlineNotifier, hub).Run(ctx)
+
+	var publisher handler.SensorPublisher
 	if url := os.Getenv("HIVEMQ_URL"); url != "" {
 		cfg := mqtt.Config{
 			URL:      url,
@@ -56,10 +64,11 @@ func main() {
 			Password: os.Getenv("HIVEMQ_PASSWORD"),
 			ClientID: os.Getenv("HIVEMQ_CLIENT_ID"),
 		}
-		sub, err := mqtt.New(cfg, pool, mqttNotifier)
+		sub, err := mqtt.New(cfg, pool, mqttNotifier, hub)
 		if err != nil {
 			log.Printf("mqtt init: %v (subscriber disabled)", err)
 		} else {
+			publisher = sub
 			defer sub.Close()
 		}
 	} else {
@@ -119,10 +128,14 @@ func main() {
 		priv.GET("/verification/requests", verH.List)
 		priv.PUT("/verification/requests/:id/status", verH.UpdateStatus)
 
-		sensorH := handler.NewSensorHandler(pool, notifier)
+		sensorH := handler.NewSensorHandler(pool, notifier, publisher, hub)
 		priv.GET("/sensors", sensorH.ListByEntrance)
 		priv.GET("/sensors/events", sensorH.ListEvents)
+		priv.GET("/sensors/events/:id", sensorH.GetEventDetail)
 		priv.GET("/admin/sensors", sensorH.ListAll)
+		priv.GET("/admin/sensors/stats", sensorH.Stats)
+		priv.GET("/admin/sensors/stream", sensorH.Stream)
+		priv.POST("/admin/sensors/:id/reset", sensorH.Reset)
 		priv.PATCH("/admin/sensors/events/:id/status", sensorH.UpdateEventStatus)
 		priv.POST("/admin/sensors/events/:id/notify", sensorH.NotifyEvent)
 
