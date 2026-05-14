@@ -14,6 +14,7 @@ import (
 	"smartresidency/internal/handler"
 	"smartresidency/internal/middleware"
 	"smartresidency/internal/mqtt"
+	"smartresidency/internal/parking"
 	"smartresidency/internal/sensors"
 )
 
@@ -28,14 +29,26 @@ func main() {
 
 	ctx := context.Background()
 
+	if err := db.RunMigrations(ctx, pool, "migrations"); err != nil {
+		log.Fatalf("migrations: %v", err)
+	}
+
 	if err := sensors.Seed(ctx, pool); err != nil {
 		log.Printf("sensors seed: %v", err)
 	} else {
 		log.Println("sensors seeded")
 	}
 
+	if err := parking.Seed(ctx, pool); err != nil {
+		log.Printf("parking seed: %v", err)
+	} else {
+		log.Println("parking seeded")
+	}
+
 	var notifier handler.EventNotifier
 	var mqttNotifier mqtt.Notifier
+	var barrierNotifier handler.BarrierNotifier
+	var parkingNotifier mqtt.ParkingNotifier
 	if credPath := os.Getenv("FIREBASE_CREDENTIALS_PATH"); credPath != "" {
 		s, err := fcm.New(ctx, credPath, pool)
 		if err != nil {
@@ -43,12 +56,15 @@ func main() {
 		} else {
 			notifier = s
 			mqttNotifier = s
+			barrierNotifier = s
+			parkingNotifier = s
 			log.Println("fcm initialized")
 		}
 	} else {
 		log.Println("FIREBASE_CREDENTIALS_PATH not set — push disabled")
 	}
 
+	var sub *mqtt.Subscriber
 	if url := os.Getenv("HIVEMQ_URL"); url != "" {
 		cfg := mqtt.Config{
 			URL:      url,
@@ -56,15 +72,31 @@ func main() {
 			Password: os.Getenv("HIVEMQ_PASSWORD"),
 			ClientID: os.Getenv("HIVEMQ_CLIENT_ID"),
 		}
-		sub, err := mqtt.New(cfg, pool, mqttNotifier)
+		s, err := mqtt.New(cfg, pool, mqttNotifier)
 		if err != nil {
 			log.Printf("mqtt init: %v (subscriber disabled)", err)
 		} else {
+			sub = s
 			defer sub.Close()
 		}
 	} else {
 		log.Println("HIVEMQ_URL not set — mqtt disabled")
 	}
+
+	var publishFn func(topic, payload string) error
+	if sub != nil {
+		publishFn = sub.Publish
+	}
+
+	barrierV2H := handler.NewBarrierV2Handler(pool, barrierNotifier, publishFn)
+	if sub != nil {
+		sub.SetBarrierCallback(barrierV2H.ProcessScanPlate)
+		if parkingNotifier != nil {
+			sub.SetParkingNotifier(parkingNotifier)
+		}
+	}
+	vehicleH := handler.NewVehicleHandler(pool)
+	adminBarrierH := handler.NewAdminBarrierHandler(pool, barrierV2H)
 
 	r := gin.Default()
 
@@ -129,6 +161,44 @@ func main() {
 		fcmH := handler.NewFCMTokenHandler(pool)
 		priv.POST("/users/me/fcm-token", fcmH.Register)
 		priv.POST("/users/me/fcm-token/delete", fcmH.Delete)
+
+		priv.GET("/vehicles", vehicleH.List)
+		priv.POST("/vehicles", vehicleH.Create)
+		priv.DELETE("/vehicles/:id", vehicleH.Delete)
+
+		priv.POST("/barrier/scan-plate", barrierV2H.ScanPlate)
+		priv.POST("/barrier/scan-qr", barrierV2H.ScanQR)
+		priv.POST("/barrier/open-manual", barrierV2H.OpenManual)
+		priv.GET("/barrier/events", barrierV2H.ListEvents)
+
+		priv.GET("/admin/barrier/events", adminBarrierH.ListAll)
+		priv.GET("/admin/barrier/unknown", adminBarrierH.ListUnknown)
+		priv.POST("/admin/barrier/unknown/:id/approve", adminBarrierH.ApproveUnknown)
+		priv.POST("/admin/barrier/unknown/:id/reject", adminBarrierH.RejectUnknown)
+
+		parkingH := handler.NewParkingHandler(pool)
+		priv.GET("/parking/spots", parkingH.ListSpots)
+		priv.GET("/parking/bookings/my", parkingH.MyBookings)
+		priv.POST("/parking/bookings", parkingH.CreateBooking)
+		priv.PUT("/parking/bookings/:id/cancel", parkingH.CancelBooking)
+		priv.GET("/admin/parking/spots", parkingH.AdminListSpots)
+		priv.POST("/admin/parking/spots/:id/assign", parkingH.AdminAssignSpot)
+		priv.GET("/admin/parking/bookings", parkingH.AdminListBookings)
+		priv.GET("/admin/parking/events", parkingH.AdminListEvents)
+
+		permitH := handler.NewParkingPermitHandler(pool, publishFn)
+		priv.GET("/parking/permit", permitH.MyPermits)
+		priv.POST("/parking/permit", permitH.Submit)
+		priv.POST("/parking/permit/:id/document", permitH.UploadDocument)
+		priv.POST("/parking/gate/scan-plate", permitH.ScanParkingGate)
+		priv.GET("/admin/parking/permits", permitH.AdminList)
+		priv.PUT("/admin/parking/permits/:id/status", permitH.AdminReview)
+
+		notifH := handler.NewNotificationsHandler(pool)
+		priv.GET("/notifications", notifH.List)
+		priv.GET("/notifications/unread-count", notifH.UnreadCount)
+		priv.PUT("/notifications/:id/read", notifH.MarkRead)
+		priv.PUT("/notifications/read-all", notifH.MarkAllRead)
 	}
 
 	port := os.Getenv("PORT")

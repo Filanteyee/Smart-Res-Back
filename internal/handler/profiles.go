@@ -18,7 +18,7 @@ func (h *ProfileHandler) Get(c *gin.Context) {
 	callerRole := c.GetString("user_role")
 
 	if id != callerID && callerRole != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		forbiddenAccess(c, "forbidden")
 		return
 	}
 
@@ -51,7 +51,7 @@ func (h *ProfileHandler) Update(c *gin.Context) {
 	callerRole := c.GetString("user_role")
 
 	if id != callerID && callerRole != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		forbiddenAccess(c, "forbidden")
 		return
 	}
 
@@ -82,7 +82,7 @@ func (h *ProfileHandler) Update(c *gin.Context) {
 		req.Entrance, req.Floor, req.Apartment,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Profile.Update/exec", err)
 		return
 	}
 
@@ -90,7 +90,7 @@ func (h *ProfileHandler) Update(c *gin.Context) {
 	row := h.db.QueryRow(ctx,
 		`SELECT`+profileCols+` FROM profiles WHERE id = $1`, id)
 	if err := p.scanFrom(row); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Profile.Update/fetch", err)
 		return
 	}
 	c.JSON(http.StatusOK, p)

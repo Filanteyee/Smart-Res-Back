@@ -53,7 +53,7 @@ func (h *ServiceRequestHandler) List(c *gin.Context) {
 			 FROM service_requests WHERE user_id = $1 ORDER BY created_at DESC`, userID)
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "ServiceRequest.List/query", err)
 		return
 	}
 	defer rows.Close()
@@ -65,7 +65,7 @@ func (h *ServiceRequestHandler) List(c *gin.Context) {
 		var r serviceRequest
 		if err := rows.Scan(&r.ID, &r.UserID, &r.Category, &r.Description,
 			&r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+			internalError(c, "ServiceRequest.List/scan", err)
 			return
 		}
 		r.Photos = []string{}
@@ -73,7 +73,7 @@ func (h *ServiceRequestHandler) List(c *gin.Context) {
 		requests = append(requests, r)
 	}
 	if rows.Err() != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "ServiceRequest.List/rows", rows.Err())
 		return
 	}
 
@@ -124,7 +124,7 @@ func (h *ServiceRequestHandler) Create(c *gin.Context) {
 		id, userID, req.Category, req.Description,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "ServiceRequest.Create/insert", err)
 		return
 	}
 
@@ -137,7 +137,7 @@ type updateStatusReq struct {
 
 func (h *ServiceRequestHandler) UpdateStatus(c *gin.Context) {
 	if c.GetString("user_role") != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		forbiddenAccess(c, "admin only")
 		return
 	}
 	id := c.Param("id")
@@ -156,7 +156,7 @@ func (h *ServiceRequestHandler) UpdateStatus(c *gin.Context) {
 	_, err := h.db.Exec(context.Background(),
 		`UPDATE service_requests SET status = $2, updated_at = NOW() WHERE id = $1`, id, req.Status)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "ServiceRequest.UpdateStatus/exec", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": req.Status})
@@ -177,7 +177,7 @@ func (h *ServiceRequestHandler) UploadPhoto(c *gin.Context) {
 	savePath := filepath.Join("uploads", "request-photos", filename)
 
 	if err := c.SaveUploadedFile(header, savePath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save file"})
+		internalError(c, "ServiceRequest.UploadPhoto/save", err)
 		return
 	}
 
@@ -186,7 +186,7 @@ func (h *ServiceRequestHandler) UploadPhoto(c *gin.Context) {
 		uuid.New().String(), requestID, savePath,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "ServiceRequest.UploadPhoto/insert", err)
 		return
 	}
 

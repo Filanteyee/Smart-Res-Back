@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"log"
+	"strings"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -12,6 +13,10 @@ import (
 
 type Notifier interface {
 	NotifyEvent(ctx context.Context, eventID string) (int, error)
+}
+
+type ParkingNotifier interface {
+	SendToUser(ctx context.Context, userID string, data map[string]string) (int, error)
 }
 
 type Config struct {
@@ -22,9 +27,11 @@ type Config struct {
 }
 
 type Subscriber struct {
-	db       *pgxpool.Pool
-	notifier Notifier
-	client   paho.Client
+	db              *pgxpool.Pool
+	notifier        Notifier
+	parkingNotifier ParkingNotifier
+	client          paho.Client
+	barrierCallback func(ctx context.Context, plate, direction, gateID string) (string, string, error)
 }
 
 func New(cfg Config, db *pgxpool.Pool, notifier Notifier) (*Subscriber, error) {
@@ -55,6 +62,27 @@ func New(cfg Config, db *pgxpool.Pool, notifier Notifier) (*Subscriber, error) {
 			log.Printf("[mqtt] subscribe events FAILED: %v", err)
 		} else {
 			log.Println("[mqtt] subscribed to smartresidency/events/+ (QoS 1)")
+		}
+		t3 := c.Subscribe("smartresidency/barrier/camera/plate", 1, s.handleBarrier)
+		t3.Wait()
+		if err := t3.Error(); err != nil {
+			log.Printf("[mqtt] subscribe barrier/camera/plate FAILED: %v", err)
+		} else {
+			log.Println("[mqtt] subscribed to smartresidency/barrier/camera/plate (QoS 1)")
+		}
+		t4 := c.Subscribe("smartresidency/barrier/motion", 1, s.handleMotion)
+		t4.Wait()
+		if err := t4.Error(); err != nil {
+			log.Printf("[mqtt] subscribe barrier/motion FAILED: %v", err)
+		} else {
+			log.Println("[mqtt] subscribed to smartresidency/barrier/motion (QoS 1)")
+		}
+		t5 := c.Subscribe("smartresidency/parking/spots/+", 1, s.handleParking)
+		t5.Wait()
+		if err := t5.Error(); err != nil {
+			log.Printf("[mqtt] subscribe parking FAILED: %v", err)
+		} else {
+			log.Println("[mqtt] subscribed to smartresidency/parking/spots/+ (QoS 1)")
 		}
 	})
 	opts.SetConnectionLostHandler(func(_ paho.Client, err error) {
@@ -169,6 +197,187 @@ func (s *Subscriber) handleEvent(_ paho.Client, m paho.Message) {
 			}
 		}(eventID)
 	}
+}
+
+type barrierMsg struct {
+	PlateNumber string  `json:"plate_number"`
+	Direction   string  `json:"direction"`
+	SensorID    string  `json:"sensor_id"`
+	GateID      string  `json:"gate_id"`
+	Confidence  float64 `json:"confidence"`
+	Status      string  `json:"status"`
+}
+
+func (s *Subscriber) handleBarrier(_ paho.Client, m paho.Message) {
+	log.Printf("[mqtt] RX %s: %s", m.Topic(), string(m.Payload()))
+	var msg barrierMsg
+	if err := json.Unmarshal(m.Payload(), &msg); err != nil {
+		log.Printf("[mqtt] barrier payload: %v", err)
+		return
+	}
+	if msg.Status == "UNREADABLE" || msg.PlateNumber == "" {
+		log.Printf("[mqtt] barrier camera: UNREADABLE gate=%s confidence=%.2f — skipped",
+			msg.GateID, msg.Confidence)
+		return
+	}
+	if s.barrierCallback != nil {
+		go func() {
+			if _, _, err := s.barrierCallback(context.Background(), msg.PlateNumber, msg.Direction, msg.GateID); err != nil {
+				log.Printf("[mqtt] barrier callback: %v", err)
+			}
+		}()
+	}
+}
+
+func (s *Subscriber) SetBarrierCallback(f func(ctx context.Context, plate, direction, gateID string) (string, string, error)) {
+	s.barrierCallback = f
+}
+
+type motionMsg struct {
+	SensorID  string `json:"sensor_id"`
+	GateID    string `json:"gate_id"`
+	Status    string `json:"status"`
+	Direction string `json:"direction"`
+}
+
+func (s *Subscriber) handleMotion(_ paho.Client, m paho.Message) {
+	log.Printf("[mqtt] RX %s: %s", m.Topic(), string(m.Payload()))
+	var msg motionMsg
+	if err := json.Unmarshal(m.Payload(), &msg); err != nil {
+		log.Printf("[mqtt] motion payload: %v", err)
+		return
+	}
+	log.Printf("[mqtt] motion detected: gate=%s sensor=%s direction=%s — waiting for camera",
+		msg.GateID, msg.SensorID, msg.Direction)
+}
+
+func (s *Subscriber) SetParkingNotifier(n ParkingNotifier) {
+	s.parkingNotifier = n
+}
+
+type parkingMsg struct {
+	SpotNumber string `json:"spot_number"`
+	EventType  string `json:"event_type"`
+}
+
+func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
+	log.Printf("[mqtt] RX %s: %s", m.Topic(), string(m.Payload()))
+	var msg parkingMsg
+	if err := json.Unmarshal(m.Payload(), &msg); err != nil {
+		log.Printf("[mqtt] parking payload: %v", err)
+		return
+	}
+	if msg.SpotNumber == "" || msg.EventType == "" {
+		log.Printf("[mqtt] parking payload: missing spot_number or event_type")
+		return
+	}
+	msg.EventType = strings.ToLower(msg.EventType)
+	if msg.EventType == "motion" {
+		log.Printf("[mqtt] parking motion detected at spot=%s — waiting for confirmed occupied", msg.SpotNumber)
+		return
+	}
+	if msg.EventType != "occupied" && msg.EventType != "freed" {
+		log.Printf("[mqtt] parking payload: unsupported event_type=%q", msg.EventType)
+		return
+	}
+
+	ctx := context.Background()
+
+	var spotID, spotType string
+	var assignedUserID *string
+	err := s.db.QueryRow(ctx,
+		`SELECT id, type, assigned_user_id FROM parking_spots WHERE spot_number = $1`, msg.SpotNumber,
+	).Scan(&spotID, &spotType, &assignedUserID)
+	if err != nil {
+		log.Printf("[mqtt] parking spot %q not found: %v", msg.SpotNumber, err)
+		return
+	}
+
+	newStatus := "free"
+	if msg.EventType == "occupied" {
+		newStatus = "occupied"
+	}
+	if _, err := s.db.Exec(ctx,
+		`UPDATE parking_spots SET status = $1 WHERE id = $2`, newStatus, spotID); err != nil {
+		log.Printf("[mqtt] parking update spot %s: %v", msg.SpotNumber, err)
+	}
+	if _, err := s.db.Exec(ctx,
+		`INSERT INTO parking_events (spot_id, event_type) VALUES ($1, $2)`, spotID, msg.EventType); err != nil {
+		log.Printf("[mqtt] parking insert event: %v", err)
+	}
+
+	if s.parkingNotifier == nil || assignedUserID == nil || spotType != "permanent" {
+		log.Printf(
+			"[mqtt] parking no fcm: spot=%s type=%s assigned=%v notifier=%v",
+			msg.SpotNumber,
+			spotType,
+			assignedUserID != nil,
+			s.parkingNotifier != nil,
+		)
+		return
+	}
+
+	uid := *assignedUserID
+	sn := msg.SpotNumber
+	if msg.EventType == "occupied" {
+		// Проверяем: владелец сам въехал за последние 30 минут?
+		// Если да — он сам припарковался, пуш не нужен.
+		// Если нет — постороннее ТС занимает место, отправляем алерт.
+		var ownerEntries int
+		_ = s.db.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM barrier_events be
+			JOIN vehicles v ON v.id = be.vehicle_id
+			WHERE v.user_id    = $1
+			  AND be.direction = 'IN'
+			  AND be.status    = 'OPENED'
+			  AND be.gate_id   = 'parking-gate'
+			  AND be.created_at > NOW() - INTERVAL '30 minutes'
+		`, uid).Scan(&ownerEntries)
+
+		if ownerEntries > 0 {
+			log.Printf("[mqtt] parking spot=%s occupied: owner vehicle entered recently (%d event(s)) — skip fcm",
+				sn, ownerEntries)
+		} else {
+			go func() {
+				data := map[string]string{
+					"kind":        "parking_alert",
+					"spot_id":     spotID,
+					"spot_number": sn,
+					"title":       "Ваше место занято",
+					"body":        "Место " + sn + " занято посторонним ТС",
+				}
+				sent, err := s.parkingNotifier.SendToUser(context.Background(), uid, data)
+				if err != nil {
+					log.Printf("[mqtt] parking fcm occupied: %v", err)
+				} else {
+					log.Printf("[mqtt] parking fcm occupied: user=%s sent=%d spot=%s", uid, sent, sn)
+				}
+			}()
+		}
+	} else if msg.EventType == "freed" {
+		go func() {
+			data := map[string]string{
+				"kind":        "parking_spot_freed",
+				"spot_id":     spotID,
+				"spot_number": sn,
+				"title":       "Ваше место освобождено",
+				"body":        "Место " + sn + " снова свободно",
+			}
+			sent, err := s.parkingNotifier.SendToUser(context.Background(), uid, data)
+			if err != nil {
+				log.Printf("[mqtt] parking fcm freed: %v", err)
+			} else {
+				log.Printf("[mqtt] parking fcm freed: user=%s sent=%d spot=%s", uid, sent, sn)
+			}
+		}()
+	}
+}
+
+func (s *Subscriber) Publish(topic, payload string) error {
+	t := s.client.Publish(topic, 1, false, payload)
+	t.Wait()
+	return t.Error()
 }
 
 func (s *Subscriber) Close() {
