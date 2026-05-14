@@ -142,7 +142,13 @@ func main() {
 		priv.GET("/service-requests", srH.List)
 		priv.POST("/service-requests", srH.Create)
 		priv.PUT("/service-requests/:id", srH.UpdateStatus)
+		priv.PATCH("/service-requests/:id/take", srH.Take)
 		priv.POST("/service-requests/:id/photos", srH.UploadPhoto)
+		priv.POST("/admin/service-requests/:id/assign", srH.Assign)
+
+		staffH := handler.NewStaffHandler(pool)
+		priv.GET("/admin/staff", staffH.List)
+		priv.GET("/admin/staff/:id/requests", staffH.Requests)
 
 		guestH := handler.NewGuestHandler(pool)
 		priv.GET("/guest-access", guestH.List)
