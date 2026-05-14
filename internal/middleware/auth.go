@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
@@ -21,10 +22,10 @@ func Auth(secret string) gin.HandlerFunc {
 		if h := c.GetHeader("Authorization"); strings.HasPrefix(h, "Bearer ") {
 			raw = strings.TrimPrefix(h, "Bearer ")
 		} else if q := c.Query("token"); q != "" {
-			// EventSource (SSE) cannot set headers — accept token in query.
 			raw = q
 		}
 		if raw == "" {
+			log.Printf("[401] missing token | ip=%s path=%s", c.ClientIP(), c.Request.URL.Path)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 			return
 		}
@@ -32,6 +33,7 @@ func Auth(secret string) gin.HandlerFunc {
 			func(t *jwt.Token) (any, error) { return []byte(secret), nil },
 		)
 		if err != nil || !token.Valid {
+			log.Printf("[401] invalid token | ip=%s path=%s | %v", c.ClientIP(), c.Request.URL.Path, err)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
 		}

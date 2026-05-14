@@ -22,7 +22,6 @@ type fcmTokenDeleteReq struct {
 	Token string `json:"token" binding:"required"`
 }
 
-// POST /api/v1/users/me/fcm-token
 func (h *FCMTokenHandler) Register(c *gin.Context) {
 	var req fcmTokenReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -40,15 +39,12 @@ func (h *FCMTokenHandler) Register(c *gin.Context) {
 		userID, req.Token, req.Platform,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "FCMToken.Register/insert", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// POST /api/v1/users/me/fcm-token/delete
-// Called by Flutter on signOut. Removes only the caller's own token —
-// user_id check prevents one user from deleting another's token.
 func (h *FCMTokenHandler) Delete(c *gin.Context) {
 	var req fcmTokenDeleteReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -61,7 +57,7 @@ func (h *FCMTokenHandler) Delete(c *gin.Context) {
 		req.Token, userID,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "FCMToken.Delete/exec", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})

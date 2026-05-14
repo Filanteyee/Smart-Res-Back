@@ -82,26 +82,56 @@ func (s *Sender) NotifyEvent(ctx context.Context, eventID string) (int, error) {
 		"body":         body,
 	}
 
-	multicast := &messaging.MulticastMessage{
-		Tokens:  tokens,
-		Data:    data,
-		Android: &messaging.AndroidConfig{Priority: "high"},
-	}
+	return s.sendMulticast(ctx, tokens, data)
+}
 
+func (s *Sender) sendMulticast(ctx context.Context, tokens []string, data map[string]string) (int, error) {
+	if len(tokens) == 0 {
+		return 0, nil
+	}
+	title, body := notificationText(data)
+	multicast := &messaging.MulticastMessage{
+		Tokens:       tokens,
+		Data:         data,
+		Notification: &messaging.Notification{Title: title, Body: body},
+		Android: &messaging.AndroidConfig{
+			Priority: "high",
+			Notification: &messaging.AndroidNotification{
+				Title:                 title,
+				Body:                  body,
+				ChannelID:             channelIDFor(data["kind"]),
+				Priority:              messaging.PriorityHigh,
+				DefaultSound:          true,
+				DefaultVibrateTimings: true,
+				Visibility:            messaging.VisibilityPublic,
+			},
+		},
+		APNS: &messaging.APNSConfig{
+			Payload: &messaging.APNSPayload{
+				Aps: &messaging.Aps{
+					Alert: &messaging.ApsAlert{
+						Title: title,
+						Body:  body,
+					},
+					Sound: "default",
+				},
+			},
+		},
+	}
 	resp, err := s.messaging.SendEachForMulticast(ctx, multicast)
 	if err != nil {
 		return 0, fmt.Errorf("send: %w", err)
 	}
-	log.Printf("[fcm] event %s: success=%d failure=%d", eventID, resp.SuccessCount, resp.FailureCount)
-
+	log.Printf("[fcm] multicast: success=%d failure=%d", resp.SuccessCount, resp.FailureCount)
 	if resp.FailureCount > 0 {
 		for i, r := range resp.Responses {
 			if r.Success {
 				continue
 			}
 			log.Printf("[fcm] token[%d] error: %v", i, r.Error)
-			if messaging.IsRegistrationTokenNotRegistered(r.Error) || messaging.IsUnregistered(r.Error) {
-				log.Printf("[fcm] pruning unregistered token: %s...", tokens[i][:20])
+			if messaging.IsUnregistered(r.Error) ||
+				messaging.IsSenderIDMismatch(r.Error) {
+				log.Printf("[fcm] pruning stale token: %s...", tokens[i][:20])
 				_, _ = s.db.Exec(ctx, `DELETE FROM fcm_tokens WHERE token = $1`, tokens[i])
 			}
 		}
@@ -109,9 +139,59 @@ func (s *Sender) NotifyEvent(ctx context.Context, eventID string) (int, error) {
 	return resp.SuccessCount, nil
 }
 
-// NotifyOffline alerts every approved admin (across all entrances) that a
-// sensor stopped responding. Used by the OFFLINE sweeper goroutine.
+func notificationText(data map[string]string) (string, string) {
+	title := data["title"]
+	body := data["body"]
+	if title != "" || body != "" {
+		return title, body
+	}
+	switch data["kind"] {
+	case "unknown_vehicle":
+		return "Неизвестный автомобиль", fmt.Sprintf("Номер: %s требует решения", data["plate_number"])
+	case "parking_alert":
+		return "Ваше место занято", fmt.Sprintf("Место %s занято посторонним ТС", data["spot_number"])
+	case "parking_spot_freed":
+		return "Ваше место освобождено", fmt.Sprintf("Место %s снова свободно", data["spot_number"])
+	case "guest_arrived":
+		return "Гость въехал", "Гость прибыл на территорию ЖК"
+	default:
+		return "Smart Residency", "Новое уведомление"
+	}
+}
+
+func channelIDFor(kind string) string {
+	switch kind {
+	case "unknown_vehicle", "guest_arrived":
+		return "barrier_events_v2"
+	case "parking_alert", "parking_spot_freed":
+		return "parking_events_v2"
+	case "sensor_alert":
+		return "sensor_alerts_v2"
+	default:
+		return "smart_residency_events"
+	}
+}
+
+// NotifyOffline alerts every approved admin that a sensor stopped responding.
+// Used by the OFFLINE sweeper goroutine.
 func (s *Sender) NotifyOffline(ctx context.Context, sensorID, sensorType string, entrance, floor int) (int, error) {
+	kind := "Водяной датчик"
+	if sensorType == "SMOKE" {
+		kind = "Датчик дыма"
+	}
+	data := map[string]string{
+		"kind":         "sensor_offline",
+		"sensor_id":    sensorID,
+		"sensor_type":  sensorType,
+		"entrance_num": fmt.Sprintf("%d", entrance),
+		"floor":        fmt.Sprintf("%d", floor),
+		"title":        "Датчик не на связи",
+		"body":         fmt.Sprintf("%s %d/%d не отвечает >60 сек", kind, entrance, floor),
+	}
+	return s.SendToAdmins(ctx, data)
+}
+
+func (s *Sender) SendToAdmins(ctx context.Context, data map[string]string) (int, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT t.token FROM fcm_tokens t
 		JOIN profiles p ON p.id = t.user_id
@@ -120,7 +200,6 @@ func (s *Sender) NotifyOffline(ctx context.Context, sensorID, sensorType string,
 		return 0, fmt.Errorf("load admin tokens: %w", err)
 	}
 	defer rows.Close()
-
 	var tokens []string
 	for rows.Next() {
 		var t string
@@ -129,50 +208,30 @@ func (s *Sender) NotifyOffline(ctx context.Context, sensorID, sensorType string,
 		}
 	}
 	if len(tokens) == 0 {
-		log.Printf("[fcm] offline %s: no admin tokens", sensorID)
+		log.Printf("[fcm] no admin tokens for kind=%s", data["kind"])
 		return 0, nil
 	}
+	return s.sendMulticast(ctx, tokens, data)
+}
 
-	kind := "Водяной датчик"
-	if sensorType == "SMOKE" {
-		kind = "Датчик дыма"
-	}
-	title := "Датчик не на связи"
-	body := fmt.Sprintf("%s %d/%d не отвечает >60 сек", kind, entrance, floor)
-
-	data := map[string]string{
-		"kind":         "sensor_offline",
-		"sensor_id":    sensorID,
-		"sensor_type":  sensorType,
-		"entrance_num": fmt.Sprintf("%d", entrance),
-		"floor":        fmt.Sprintf("%d", floor),
-		"title":        title,
-		"body":         body,
-	}
-
-	multicast := &messaging.MulticastMessage{
-		Tokens:  tokens,
-		Data:    data,
-		Android: &messaging.AndroidConfig{Priority: "high"},
-	}
-
-	resp, err := s.messaging.SendEachForMulticast(ctx, multicast)
+func (s *Sender) SendToUser(ctx context.Context, userID string, data map[string]string) (int, error) {
+	rows, err := s.db.Query(ctx, `SELECT token FROM fcm_tokens WHERE user_id = $1`, userID)
 	if err != nil {
-		return 0, fmt.Errorf("send offline: %w", err)
+		return 0, fmt.Errorf("load user tokens: %w", err)
 	}
-	log.Printf("[fcm] offline %s: success=%d failure=%d", sensorID, resp.SuccessCount, resp.FailureCount)
-
-	if resp.FailureCount > 0 {
-		for i, r := range resp.Responses {
-			if r.Success {
-				continue
-			}
-			if messaging.IsRegistrationTokenNotRegistered(r.Error) || messaging.IsUnregistered(r.Error) {
-				_, _ = s.db.Exec(ctx, `DELETE FROM fcm_tokens WHERE token = $1`, tokens[i])
-			}
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err == nil {
+			tokens = append(tokens, t)
 		}
 	}
-	return resp.SuccessCount, nil
+	if len(tokens) == 0 {
+		log.Printf("[fcm] no tokens for user=%s kind=%s", userID, data["kind"])
+		return 0, nil
+	}
+	return s.sendMulticast(ctx, tokens, data)
 }
 
 func messageFor(typ, status, threat string, entrance, floor int) (string, string) {

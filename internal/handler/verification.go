@@ -86,7 +86,7 @@ func (h *VerificationHandler) Submit(c *gin.Context) {
 		req.Entrance, req.Floor, apartmentStr,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Verification.Submit/insert", err)
 		return
 	}
 
@@ -117,7 +117,7 @@ func (h *VerificationHandler) UploadDocuments(c *gin.Context) {
 	baseURL := os.Getenv("BASE_URL")
 	dir := filepath.Join("uploads", "verification-docs", userID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Verification.UploadDocuments/mkdir", err)
 		return
 	}
 
@@ -128,7 +128,7 @@ func (h *VerificationHandler) UploadDocuments(c *gin.Context) {
 		savePath := filepath.Join(dir, filename)
 
 		if err := c.SaveUploadedFile(fh, savePath); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save file"})
+			internalError(c, "Verification.UploadDocuments/save", err)
 			return
 		}
 
@@ -139,7 +139,7 @@ func (h *VerificationHandler) UploadDocuments(c *gin.Context) {
 			uuid.New().String(), verID, savePath, fh.Filename, fh.Size,
 		)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+			internalError(c, "Verification.UploadDocuments/insert", err)
 			return
 		}
 		uploaded = append(uploaded,
@@ -186,7 +186,7 @@ func (h *VerificationHandler) List(c *gin.Context) {
 			ORDER BY vr.created_at DESC`, userID)
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Verification.List/query", err)
 		return
 	}
 	defer rows.Close()
@@ -203,7 +203,7 @@ func (h *VerificationHandler) List(c *gin.Context) {
 			&r.ReviewedBy, &r.ReviewedAt, &r.CreatedAt, &r.UpdatedAt,
 			&prof.FullName, &prof.Email, &prof.Phone, &prof.IIN, &prof.FullAddress,
 		); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+			internalError(c, "Verification.List/scan", err)
 			return
 		}
 		r.Profile = &prof
@@ -245,7 +245,7 @@ type updateVerStatusReq struct {
 
 func (h *VerificationHandler) UpdateStatus(c *gin.Context) {
 	if c.GetString("user_role") != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin only"})
+		forbiddenAccess(c, "admin only")
 		return
 	}
 
@@ -273,7 +273,7 @@ func (h *VerificationHandler) UpdateStatus(c *gin.Context) {
 		 RETURNING user_id`, id, req.Status, reviewerID,
 	).Scan(&targetUserID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Verification.UpdateStatus/exec", err)
 		return
 	}
 

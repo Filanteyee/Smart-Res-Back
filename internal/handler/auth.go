@@ -46,7 +46,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Auth.Register/bcrypt", err)
 		return
 	}
 
@@ -62,7 +62,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Auth.Register/users", err)
 		return
 	}
 
@@ -78,13 +78,13 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		req.Entrance, req.Floor, req.Apartment,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Auth.Register/profiles", err)
 		return
 	}
 
 	token, err := makeToken(userID, req.Email, "resident")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Auth.Register/token", err)
 		return
 	}
 
@@ -124,7 +124,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	token, err := makeToken(userID, req.Email, role)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Auth.Login/token", err)
 		return
 	}
 
@@ -142,13 +142,13 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		 WHERE u.id = $1`, userID,
 	).Scan(&email, &role)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Auth.Refresh/query", err)
 		return
 	}
 
 	token, err := makeToken(userID, email, role)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Auth.Refresh/token", err)
 		return
 	}
 

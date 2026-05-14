@@ -26,7 +26,7 @@ type EventNotifier interface {
 // SensorPublisher writes MQTT messages (used by /admin/sensors/:id/reset).
 // Implemented by *mqtt.Subscriber. May be nil when MQTT is disabled.
 type SensorPublisher interface {
-	Publish(topic string, payload any) error
+	PublishRetain(topic string, payload any) error
 }
 
 type SensorHandler struct {
@@ -97,7 +97,6 @@ func scanEvents(rows pgx.Rows) ([]SensorEvent, error) {
 	return out, rows.Err()
 }
 
-// GET /api/v1/sensors?entrance=N
 func (h *SensorHandler) ListByEntrance(c *gin.Context) {
 	e, err := strconv.Atoi(c.Query("entrance"))
 	if err != nil || e < 1 {
@@ -108,40 +107,37 @@ func (h *SensorHandler) ListByEntrance(c *gin.Context) {
 		`SELECT `+sensorCols+` FROM sensors WHERE entrance_num=$1
 		 ORDER BY floor ASC, type ASC`, e)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.ListByEntrance/query", err)
 		return
 	}
 	out, err := scanSensors(rows)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.ListByEntrance/scan", err)
 		return
 	}
 	c.JSON(http.StatusOK, out)
 }
 
-// GET /api/v1/admin/sensors
 func (h *SensorHandler) ListAll(c *gin.Context) {
 	if c.GetString("user_role") != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin only"})
+		forbiddenAccess(c, "admin only")
 		return
 	}
 	rows, err := h.db.Query(c.Request.Context(),
 		`SELECT `+sensorCols+` FROM sensors
 		 ORDER BY entrance_num ASC, floor ASC, type ASC`)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.ListAll/query", err)
 		return
 	}
 	out, err := scanSensors(rows)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.ListAll/scan", err)
 		return
 	}
 	c.JSON(http.StatusOK, out)
 }
 
-// GET /api/v1/sensors/events?entrance=&status=
-// Resident: entrance forced from profile. Admin: optional filters.
 func (h *SensorHandler) ListEvents(c *gin.Context) {
 	role := c.GetString("user_role")
 	userID := c.GetString("user_id")
@@ -180,12 +176,12 @@ func (h *SensorHandler) ListEvents(c *gin.Context) {
 
 	rows, err := h.db.Query(ctx, q, args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.ListEvents/query", err)
 		return
 	}
 	out, err := scanEvents(rows)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.ListEvents/scan", err)
 		return
 	}
 	c.JSON(http.StatusOK, out)
@@ -197,10 +193,9 @@ type updateEventStatusReq struct {
 	AdminComment string `json:"admin_comment"`
 }
 
-// PATCH /api/v1/admin/sensors/events/:id/status
 func (h *SensorHandler) UpdateEventStatus(c *gin.Context) {
 	if c.GetString("user_role") != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin only"})
+		forbiddenAccess(c, "admin only")
 		return
 	}
 	id := c.Param("id")
@@ -260,7 +255,7 @@ func (h *SensorHandler) UpdateEventStatus(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "event not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.UpdateEventStatus/exec", err)
 		return
 	}
 
@@ -276,10 +271,6 @@ func (h *SensorHandler) UpdateEventStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, e)
 }
 
-// GET /api/v1/admin/sensors/stream — Server-Sent Events feed for admins.
-// Token comes in `?token=<jwt>` because EventSource cannot set headers.
-// Frames emitted by mqtt subscriber, sweeper, and UpdateEventStatus:
-//   event: sensor_update | event_new | event_status | sensor_offline
 func (h *SensorHandler) Stream(c *gin.Context) {
 	if c.GetString("user_role") != "admin" {
 		c.JSON(http.StatusForbidden, gin.H{"error": "admin only"})
@@ -331,10 +322,9 @@ func (h *SensorHandler) Stream(c *gin.Context) {
 	}
 }
 
-// POST /api/v1/admin/sensors/events/:id/notify
 func (h *SensorHandler) NotifyEvent(c *gin.Context) {
 	if c.GetString("user_role") != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin only"})
+		forbiddenAccess(c, "admin only")
 		return
 	}
 	id := c.Param("id")
@@ -347,7 +337,7 @@ func (h *SensorHandler) NotifyEvent(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "event not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
+		internalError(c, "Sensor.NotifyEvent/query", err)
 		return
 	}
 
@@ -358,7 +348,7 @@ func (h *SensorHandler) NotifyEvent(c *gin.Context) {
 
 	sent, err := h.notifier.NotifyEvent(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, "Sensor.NotifyEvent/fcm", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"sent": sent})
@@ -400,7 +390,7 @@ func (h *SensorHandler) Reset(c *gin.Context) {
 		"floor":        s.Floor,
 		"status":       "NORMAL",
 	}
-	if err := h.publisher.Publish(topic, payload); err != nil {
+	if err := h.publisher.PublishRetain(topic, payload); err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "publish failed: " + err.Error()})
 		return
 	}
