@@ -87,10 +87,49 @@ func (h *ParkingPermitHandler) ProcessParkingGate(ctx context.Context, plateNumb
 			RETURNING id`, direction, plate, vehicleID,
 		).Scan(&eventID)
 		h.publishParkingGateCommand(direction, "REJECT", "no_approved_parking_permit")
+
+		// Сохраняем уведомления в колокольчик — резиденту и всем админам
+		go func(evtID, uid, pl string) {
+			userBody := fmt.Sprintf("Ваш автомобиль %s не имеет пропуска в паркинг. Пожалуйста, освободите въезд.", pl)
+			adminBody := fmt.Sprintf("Автомобиль %s у шлагбаума паркинга — нет действующего пропуска.", pl)
+			jsonData := fmt.Sprintf(`{"event_id":"%s","plate_number":"%s","gate_id":"parking-gate"}`, evtID, pl)
+			if _, dbErr := h.db.Exec(context.Background(), `
+				INSERT INTO notifications (target_user_id, kind, title, body, data)
+				VALUES ($1, 'parking_no_permit', '🚫 Нет доступа в паркинг', $2, $3)`,
+				uid, userBody, jsonData,
+			); dbErr != nil {
+				log.Printf("[parking-gate] notification insert user: %v", dbErr)
+			}
+			if _, dbErr := h.db.Exec(context.Background(), `
+				INSERT INTO notifications (target_role, kind, title, body, data)
+				VALUES ('admin', 'parking_no_permit', '⚠️ Нет пропуска на паркинг', $1, $2)`,
+				adminBody, jsonData,
+			); dbErr != nil {
+				log.Printf("[parking-gate] notification insert admin: %v", dbErr)
+			}
+		}(eventID, userID, plate)
+
 		if h.notifier != nil {
+			// FCM владельцу машины
+			go func(evtID, uid, pl string) {
+				data := map[string]string{
+					"kind":         "parking_no_permit",
+					"event_id":     evtID,
+					"plate_number": pl,
+					"title":        "🚫 Нет доступа в паркинг",
+					"body":         fmt.Sprintf("Ваш автомобиль %s не имеет пропуска. Освободите въезд в паркинг.", pl),
+				}
+				sent, err2 := h.notifier.SendToUser(context.Background(), uid, data)
+				if err2 != nil {
+					log.Printf("[parking-gate] fcm no-permit user: %v", err2)
+				} else {
+					log.Printf("[parking-gate] fcm no-permit user=%s sent=%d plate=%s", uid, sent, pl)
+				}
+			}(eventID, userID, plate)
+			// FCM админам
 			go func(evtID, pl string) {
 				data := map[string]string{
-					"kind":         "unknown_vehicle",
+					"kind":         "parking_no_permit",
 					"event_id":     evtID,
 					"plate_number": pl,
 					"title":        "⚠️ Нет пропуска на паркинг",
@@ -98,9 +137,9 @@ func (h *ParkingPermitHandler) ProcessParkingGate(ctx context.Context, plateNumb
 				}
 				sent, err2 := h.notifier.SendToAdmins(context.Background(), data)
 				if err2 != nil {
-					log.Printf("[parking-gate] fcm no-permit: %v", err2)
+					log.Printf("[parking-gate] fcm no-permit admins: %v", err2)
 				} else {
-					log.Printf("[parking-gate] fcm no-permit: sent=%d plate=%s", sent, pl)
+					log.Printf("[parking-gate] fcm no-permit admins sent=%d plate=%s", sent, pl)
 				}
 			}(eventID, plate)
 		}
@@ -191,7 +230,8 @@ func (h *ParkingPermitHandler) MyPermits(c *gin.Context) {
 func (h *ParkingPermitHandler) Submit(c *gin.Context) {
 	userID := c.GetString("user_id")
 	var req struct {
-		VehicleID string `json:"vehicle_id" binding:"required"`
+		VehicleID string  `json:"vehicle_id" binding:"required"`
+		SpotID    *string `json:"spot_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -230,10 +270,10 @@ func (h *ParkingPermitHandler) Submit(c *gin.Context) {
 
 	var p ParkingPermit
 	if err := h.db.QueryRow(ctx, `
-		INSERT INTO parking_permits (user_id, vehicle_id)
-		VALUES ($1, $2)
+		INSERT INTO parking_permits (user_id, vehicle_id, spot_id)
+		VALUES ($1, $2, $3)
 		RETURNING id, user_id, vehicle_id, spot_id, status, document_url, admin_comment, created_at, reviewed_at`,
-		userID, req.VehicleID,
+		userID, req.VehicleID, req.SpotID,
 	).Scan(&p.ID, &p.UserID, &p.VehicleID, &p.SpotID, &p.Status,
 		&p.DocumentURL, &p.AdminComment, &p.CreatedAt, &p.ReviewedAt); err != nil {
 		internalError(c, "Permit.Submit/insert", err)
