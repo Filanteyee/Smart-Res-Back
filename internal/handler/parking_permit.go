@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,12 +18,127 @@ import (
 )
 
 type ParkingPermitHandler struct {
-	db      *pgxpool.Pool
-	publish func(topic, payload string) error
+	db       *pgxpool.Pool
+	publish  func(topic, payload string) error
+	notifier BarrierNotifier
 }
 
-func NewParkingPermitHandler(db *pgxpool.Pool, publish func(topic, payload string) error) *ParkingPermitHandler {
-	return &ParkingPermitHandler{db: db, publish: publish}
+func NewParkingPermitHandler(db *pgxpool.Pool, publish func(topic, payload string) error, notifier BarrierNotifier) *ParkingPermitHandler {
+	return &ParkingPermitHandler{db: db, publish: publish, notifier: notifier}
+}
+
+// ProcessParkingGate — бизнес-логика шлагбаума паркинга для MQTT и HTTP.
+// Правила строже чем у основного шлагбаума: нужны vehicle + approved parking_permit.
+func (h *ParkingPermitHandler) ProcessParkingGate(ctx context.Context, plateNumber, direction, _ string) (action, eventID string, err error) {
+	plate := strings.ToUpper(strings.TrimSpace(plateNumber))
+	if plate == "" {
+		h.publishParkingGateCommand(direction, "REJECT", "empty_plate")
+		return "REJECT", "", nil
+	}
+	if direction == "" {
+		direction = "IN"
+	}
+
+	// Шаг 1: машина должна быть зарегистрирована
+	var vehicleID, userID string
+	err = h.db.QueryRow(ctx,
+		`SELECT id, user_id FROM vehicles WHERE plate_number = $1 AND is_active = true`, plate,
+	).Scan(&vehicleID, &userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_ = h.db.QueryRow(ctx, `
+			INSERT INTO barrier_events (event_type, direction, plate_number, status, gate_id)
+			VALUES ('UNKNOWN', $1, $2, 'PENDING', 'parking-gate')
+			RETURNING id`, direction, plate,
+		).Scan(&eventID)
+		h.publishParkingGateCommand(direction, "REJECT", "unknown_vehicle")
+		if h.notifier != nil {
+			go func(evtID, pl, dir string) {
+				data := map[string]string{
+					"kind":         "unknown_vehicle",
+					"event_id":     evtID,
+					"plate_number": pl,
+					"direction":    dir,
+					"title":        "⚠️ Неизвестное ТС (паркинг)",
+					"body":         fmt.Sprintf("Номер: %s пытается въехать в паркинг", pl),
+				}
+				sent, err2 := h.notifier.SendToAdmins(context.Background(), data)
+				if err2 != nil {
+					log.Printf("[parking-gate] fcm unknown: %v", err2)
+				} else {
+					log.Printf("[parking-gate] fcm unknown: sent=%d plate=%s", sent, pl)
+				}
+			}(eventID, plate, direction)
+		}
+		return "REJECT", eventID, nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+
+	// Шаг 2: должен быть одобренный parking_permit
+	var permitID string
+	err = h.db.QueryRow(ctx,
+		`SELECT id FROM parking_permits WHERE vehicle_id = $1 AND status = 'approved'`, vehicleID,
+	).Scan(&permitID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_ = h.db.QueryRow(ctx, `
+			INSERT INTO barrier_events (event_type, direction, plate_number, vehicle_id, status, gate_id)
+			VALUES ('PARKING_REJECTED', $1, $2, $3, 'PENDING', 'parking-gate')
+			RETURNING id`, direction, plate, vehicleID,
+		).Scan(&eventID)
+		h.publishParkingGateCommand(direction, "REJECT", "no_approved_parking_permit")
+		if h.notifier != nil {
+			go func(evtID, pl string) {
+				data := map[string]string{
+					"kind":         "unknown_vehicle",
+					"event_id":     evtID,
+					"plate_number": pl,
+					"title":        "⚠️ Нет пропуска на паркинг",
+					"body":         fmt.Sprintf("Номер: %s — нет разрешения на въезд в паркинг", pl),
+				}
+				sent, err2 := h.notifier.SendToAdmins(context.Background(), data)
+				if err2 != nil {
+					log.Printf("[parking-gate] fcm no-permit: %v", err2)
+				} else {
+					log.Printf("[parking-gate] fcm no-permit: sent=%d plate=%s", sent, pl)
+				}
+			}(eventID, plate)
+		}
+		return "REJECT", eventID, nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+
+	// Шаг 3: открыть шлагбаум паркинга
+	h.publishParkingGateCommand(direction, "OPEN", "")
+	err = h.db.QueryRow(ctx, `
+		INSERT INTO barrier_events (event_type, direction, plate_number, vehicle_id, status, gate_id)
+		VALUES ('AUTO_RECOGNIZED', $1, $2, $3, 'OPENED', 'parking-gate')
+		RETURNING id`, direction, plate, vehicleID,
+	).Scan(&eventID)
+	if err != nil {
+		return "", "", err
+	}
+	log.Printf("[parking-gate] OPEN plate=%s dir=%s permit=%s", plate, direction, permitID)
+	return "OPEN", eventID, nil
+}
+
+func (h *ParkingPermitHandler) publishParkingGateCommand(direction, action, reason string) {
+	if h.publish == nil {
+		return
+	}
+	if direction == "" {
+		direction = "IN"
+	}
+	payload := fmt.Sprintf(`{"action":"%s","direction":"%s","gate_id":"parking-gate"`, action, direction)
+	if reason != "" {
+		payload += fmt.Sprintf(`,"reason":"%s"`, reason)
+	}
+	payload += "}"
+	if err := h.publish("smartresidency/parking/gate/command", payload); err != nil {
+		log.Printf("[parking-gate] publish command: %v", err)
+	}
 }
 
 type ParkingPermit struct {
@@ -244,6 +362,7 @@ func (h *ParkingPermitHandler) AdminReview(c *gin.Context) {
 	}
 
 	var userID, vehicleID string
+	var finalSpotID *string
 	err := h.db.QueryRow(ctx, `
 		UPDATE parking_permits
 		SET status        = $2,
@@ -251,8 +370,8 @@ func (h *ParkingPermitHandler) AdminReview(c *gin.Context) {
 		    spot_id       = COALESCE($4, spot_id),
 		    reviewed_at   = NOW()
 		WHERE id = $1
-		RETURNING user_id, vehicle_id`, id, req.Status, commentPtr, req.SpotID,
-	).Scan(&userID, &vehicleID)
+		RETURNING user_id, vehicle_id, spot_id`, id, req.Status, commentPtr, req.SpotID,
+	).Scan(&userID, &vehicleID, &finalSpotID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "permit not found"})
 		return
@@ -260,6 +379,13 @@ func (h *ParkingPermitHandler) AdminReview(c *gin.Context) {
 	if err != nil {
 		internalError(c, "Permit.AdminReview/update", err)
 		return
+	}
+
+	// Sync parking_spots.assigned_user_id so handleParking can identify the owner for FCM.
+	if req.Status == "approved" && finalSpotID != nil {
+		_, _ = h.db.Exec(ctx,
+			`UPDATE parking_spots SET assigned_user_id = $1 WHERE id = $2`,
+			userID, *finalSpotID)
 	}
 
 	// Синхронизируем parking_permit_status в профиле для UI-совместимости
@@ -291,6 +417,7 @@ func (h *ParkingPermitHandler) ScanParkingGate(c *gin.Context) {
 		req.PlateNumber,
 	).Scan(&vehicleID, &userID)
 	if errors.Is(err, pgx.ErrNoRows) {
+		h.publishParkingGateCommand(req.Direction, "REJECT", "vehicle_not_registered")
 		c.JSON(http.StatusForbidden, gin.H{"action": "REJECTED", "reason": "vehicle not registered"})
 		return
 	}
@@ -305,6 +432,7 @@ func (h *ParkingPermitHandler) ScanParkingGate(c *gin.Context) {
 		vehicleID,
 	).Scan(&permitID)
 	if errors.Is(err, pgx.ErrNoRows) {
+		h.publishParkingGateCommand(req.Direction, "REJECT", "no_approved_parking_permit")
 		c.JSON(http.StatusForbidden, gin.H{
 			"action": "REJECTED",
 			"reason": "no approved parking permit for this vehicle",
@@ -316,10 +444,7 @@ func (h *ParkingPermitHandler) ScanParkingGate(c *gin.Context) {
 		return
 	}
 
-	if h.publish != nil {
-		payload := `{"action":"OPEN","direction":"` + req.Direction + `"}`
-		_ = h.publish("smartresidency/parking/gate/command", payload)
-	}
+	h.publishParkingGateCommand(req.Direction, "OPEN", "")
 
 	var eventID string
 	_ = h.db.QueryRow(ctx, `

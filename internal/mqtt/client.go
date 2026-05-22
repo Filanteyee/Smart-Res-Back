@@ -31,12 +31,13 @@ type Config struct {
 }
 
 type Subscriber struct {
-	db              *pgxpool.Pool
-	notifier        Notifier
-	bcast           Broadcaster
-	parkingNotifier ParkingNotifier
-	client          paho.Client
-	barrierCallback func(ctx context.Context, plate, direction, gateID string) (string, string, error)
+	db                  *pgxpool.Pool
+	notifier            Notifier
+	bcast               Broadcaster
+	parkingNotifier     ParkingNotifier
+	client              paho.Client
+	barrierCallback     func(ctx context.Context, plate, direction, gateID string) (string, string, error)
+	parkingGateCallback func(ctx context.Context, plate, direction, gateID string) (string, string, error)
 }
 
 func New(cfg Config, db *pgxpool.Pool, notifier Notifier, bcast Broadcaster) (*Subscriber, error) {
@@ -259,17 +260,58 @@ func (s *Subscriber) handleBarrier(_ paho.Client, m paho.Message) {
 			msg.GateID, msg.Confidence)
 		return
 	}
+	if msg.GateID == "parking-gate" {
+		if s.parkingGateCallback != nil {
+			go func() {
+				action, eventID, err := s.parkingGateCallback(context.Background(), msg.PlateNumber, msg.Direction, msg.GateID)
+				if err != nil {
+					log.Printf("[mqtt] parking gate callback: %v", err)
+					return
+				}
+				logGateDecision("parking-gate", msg.PlateNumber, msg.Direction, action, eventID)
+			}()
+		}
+		return
+	}
 	if s.barrierCallback != nil {
 		go func() {
-			if _, _, err := s.barrierCallback(context.Background(), msg.PlateNumber, msg.Direction, msg.GateID); err != nil {
-				log.Printf("[mqtt] barrier callback: %v", err)
+			gateID := msg.GateID
+			if gateID == "" {
+				gateID = "main-gate"
 			}
+			action, eventID, err := s.barrierCallback(context.Background(), msg.PlateNumber, msg.Direction, gateID)
+			if err != nil {
+				log.Printf("[mqtt] barrier callback: %v", err)
+				return
+			}
+			logGateDecision(gateID, msg.PlateNumber, msg.Direction, action, eventID)
 		}()
+	}
+}
+
+func logGateDecision(gateID, plate, direction, action, eventID string) {
+	if direction == "" {
+		direction = "IN"
+	}
+	switch action {
+	case "OPEN":
+		log.Printf("[mqtt] gate decision: gate=%s plate=%s direction=%s access=GRANTED event_id=%s",
+			gateID, plate, direction, eventID)
+	case "REJECT":
+		log.Printf("[mqtt] gate decision: gate=%s plate=%s direction=%s access=DENIED event_id=%s",
+			gateID, plate, direction, eventID)
+	default:
+		log.Printf("[mqtt] gate decision: gate=%s plate=%s direction=%s action=%s event_id=%s",
+			gateID, plate, direction, action, eventID)
 	}
 }
 
 func (s *Subscriber) SetBarrierCallback(f func(ctx context.Context, plate, direction, gateID string) (string, string, error)) {
 	s.barrierCallback = f
+}
+
+func (s *Subscriber) SetParkingGateCallback(f func(ctx context.Context, plate, direction, gateID string) (string, string, error)) {
+	s.parkingGateCallback = f
 }
 
 type motionMsg struct {

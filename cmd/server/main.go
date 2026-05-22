@@ -97,8 +97,10 @@ func main() {
 	}
 
 	barrierV2H := handler.NewBarrierV2Handler(pool, barrierNotifier, publishFn)
+	permitH := handler.NewParkingPermitHandler(pool, publishFn, barrierNotifier)
 	if sub != nil {
 		sub.SetBarrierCallback(barrierV2H.ProcessScanPlate)
+		sub.SetParkingGateCallback(permitH.ProcessParkingGate)
 		if parkingNotifier != nil {
 			sub.SetParkingNotifier(parkingNotifier)
 		}
@@ -204,7 +206,6 @@ func main() {
 		priv.GET("/admin/parking/bookings", parkingH.AdminListBookings)
 		priv.GET("/admin/parking/events", parkingH.AdminListEvents)
 
-		permitH := handler.NewParkingPermitHandler(pool, publishFn)
 		priv.GET("/parking/permit", permitH.MyPermits)
 		priv.POST("/parking/permit", permitH.Submit)
 		priv.POST("/parking/permit/:id/document", permitH.UploadDocument)
