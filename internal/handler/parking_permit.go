@@ -39,18 +39,89 @@ func (h *ParkingPermitHandler) ProcessParkingGate(ctx context.Context, plateNumb
 		direction = "IN"
 	}
 
+	// Шаг 0: гость с машиной и зарезервированным местом (второй скан — въезд в паркинг)
+	var guestPassID2, guestResidentID2, guestName2 string
+	var guestSpotID2 *string
+	if gsErr := h.db.QueryRow(ctx, `
+		SELECT id, resident_id, guest_name, parking_spot_id
+		FROM guest_access
+		WHERE UPPER(TRIM(car_number)) = $1
+		  AND status = 'arrived'
+		  AND valid_until > NOW()
+		LIMIT 1`, plate,
+	).Scan(&guestPassID2, &guestResidentID2, &guestName2, &guestSpotID2); gsErr == nil {
+		h.publishParkingGateCommand(direction, "OPEN", "")
+		if _, err = h.db.Exec(ctx, `UPDATE guest_access SET status = 'used' WHERE id = $1`, guestPassID2); err != nil {
+			return "", "", err
+		}
+		if guestSpotID2 != nil {
+			_, _ = h.db.Exec(ctx, `UPDATE parking_spots SET status = 'occupied' WHERE id = $1`, *guestSpotID2)
+		}
+		if err = h.db.QueryRow(ctx, `
+			INSERT INTO barrier_events (event_type, direction, plate_number, guest_pass_id, status, gate_id)
+			VALUES ('PLATE_SCAN_PARKING', $1, $2, $3, 'OPENED', 'parking-gate')
+			RETURNING id`, direction, plate, guestPassID2,
+		).Scan(&eventID); err != nil {
+			return "", "", err
+		}
+		go func(evtID, rID, gName, dir string) {
+			bgCtx := context.Background()
+			title := "Ваш гость в паркинге"
+			body := "Гость " + gName + " припарковался в паркинге"
+			jsonData := fmt.Sprintf(`{"event_id":"%s","guest_name":"%s","direction":"%s"}`, evtID, gName, dir)
+			if _, dbErr := h.db.Exec(bgCtx, `
+				INSERT INTO notifications (target_user_id, kind, title, body, data)
+				VALUES ($1, 'guest_arrived', $2, $3, $4)`,
+				rID, title, body, jsonData,
+			); dbErr != nil {
+				log.Printf("[parking-gate] guest parking bell: %v", dbErr)
+			}
+			if h.notifier != nil {
+				sent, err2 := h.notifier.SendToUser(bgCtx, rID, map[string]string{
+					"event_id":   evtID,
+					"kind":       "guest_arrived",
+					"guest_name": gName,
+					"direction":  dir,
+					"title":      title,
+					"body":       body,
+				})
+				if err2 != nil {
+					log.Printf("[parking-gate] guest parking fcm: %v", err2)
+				} else {
+					log.Printf("[parking-gate] guest parking fcm: resident=%s sent=%d guest=%s", rID, sent, gName)
+				}
+			}
+		}(eventID, guestResidentID2, guestName2, direction)
+		return "OPEN", eventID, nil
+	}
+
 	// Шаг 1: машина должна быть зарегистрирована
 	var vehicleID, userID string
 	err = h.db.QueryRow(ctx,
 		`SELECT id, user_id FROM vehicles WHERE plate_number = $1 AND is_active = true`, plate,
 	).Scan(&vehicleID, &userID)
 	if errors.Is(err, pgx.ErrNoRows) {
+		log.Printf("[parking-gate] UNKNOWN vehicle: plate=%s", plate)
 		_ = h.db.QueryRow(ctx, `
 			INSERT INTO barrier_events (event_type, direction, plate_number, status, gate_id)
 			VALUES ('UNKNOWN', $1, $2, 'PENDING', 'parking-gate')
 			RETURNING id`, direction, plate,
 		).Scan(&eventID)
 		h.publishParkingGateCommand(direction, "REJECT", "unknown_vehicle")
+
+		// Bell notification for admins — always, regardless of FCM availability.
+		go func(evtID, pl string) {
+			body := fmt.Sprintf("Номер: %s пытается въехать в паркинг", pl)
+			data := fmt.Sprintf(`{"event_id":"%s","plate_number":"%s","gate_id":"parking-gate"}`, evtID, pl)
+			if _, dbErr := h.db.Exec(context.Background(), `
+				INSERT INTO notifications (target_role, kind, title, body, data)
+				VALUES ('admin', 'unknown_vehicle', '⚠️ Неизвестное ТС (паркинг)', $1, $2)`,
+				body, data,
+			); dbErr != nil {
+				log.Printf("[parking-gate] unknown bell: %v", dbErr)
+			}
+		}(eventID, plate)
+
 		if h.notifier != nil {
 			go func(evtID, pl, dir string) {
 				data := map[string]string{
@@ -81,6 +152,7 @@ func (h *ParkingPermitHandler) ProcessParkingGate(ctx context.Context, plateNumb
 		`SELECT id FROM parking_permits WHERE vehicle_id = $1 AND status = 'approved'`, vehicleID,
 	).Scan(&permitID)
 	if errors.Is(err, pgx.ErrNoRows) {
+		log.Printf("[parking-gate] no_permit: plate=%s user=%s — saving bell+fcm", plate, userID)
 		_ = h.db.QueryRow(ctx, `
 			INSERT INTO barrier_events (event_type, direction, plate_number, vehicle_id, status, gate_id)
 			VALUES ('PARKING_REJECTED', $1, $2, $3, 'PENDING', 'parking-gate')
@@ -98,14 +170,18 @@ func (h *ParkingPermitHandler) ProcessParkingGate(ctx context.Context, plateNumb
 				VALUES ($1, 'parking_no_permit', '🚫 Нет доступа в паркинг', $2, $3)`,
 				uid, userBody, jsonData,
 			); dbErr != nil {
-				log.Printf("[parking-gate] notification insert user: %v", dbErr)
+				log.Printf("[parking-gate] notification insert user FAILED: %v", dbErr)
+			} else {
+				log.Printf("[parking-gate] notification bell saved: user=%s plate=%s", uid, pl)
 			}
 			if _, dbErr := h.db.Exec(context.Background(), `
 				INSERT INTO notifications (target_role, kind, title, body, data)
 				VALUES ('admin', 'parking_no_permit', '⚠️ Нет пропуска на паркинг', $1, $2)`,
 				adminBody, jsonData,
 			); dbErr != nil {
-				log.Printf("[parking-gate] notification insert admin: %v", dbErr)
+				log.Printf("[parking-gate] notification insert admin FAILED: %v", dbErr)
+			} else {
+				log.Printf("[parking-gate] notification bell saved: role=admin plate=%s", pl)
 			}
 		}(eventID, userID, plate)
 
@@ -253,6 +329,20 @@ func (h *ParkingPermitHandler) Submit(c *gin.Context) {
 		return
 	}
 
+	// Проверяем лимит: не более 3 отклонённых заявок по user_id
+	var rejectedCount int
+	if err := h.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM parking_permits WHERE user_id = $1 AND status = 'rejected'`,
+		userID,
+	).Scan(&rejectedCount); err != nil {
+		internalError(c, "Permit.Submit/countRejected", err)
+		return
+	}
+	if rejectedCount >= 3 {
+		c.JSON(http.StatusForbidden, gin.H{"error": "max_rejections_reached", "rejected_count": rejectedCount})
+		return
+	}
+
 	// Нет pending/approved заявки на эту машину
 	var existStatus string
 	err := h.db.QueryRow(ctx,
@@ -392,6 +482,10 @@ func (h *ParkingPermitHandler) AdminReview(c *gin.Context) {
 	}
 	if req.Status != "approved" && req.Status != "rejected" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be approved or rejected"})
+		return
+	}
+	if req.Status == "rejected" && strings.TrimSpace(req.AdminComment) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "admin_comment is required when rejecting"})
 		return
 	}
 

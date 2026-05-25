@@ -384,7 +384,7 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 			SELECT id, resident_id, COALESCE(car_number, '')
 			FROM guest_access
 			WHERE parking_spot_id = $1
-			  AND status = 'active'
+			  AND status IN ('active', 'arrived')
 			  AND valid_from <= NOW()
 			  AND valid_until >= NOW()
 			LIMIT 1
@@ -474,16 +474,21 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 		sn := msg.SpotNumber
 
 		if msg.EventType == "occupied" {
-			// Въезжала ли ожидаемая машина недавно?
+			// Въезжала ли ожидаемая машина в паркинг недавно?
+			// Учитываем: распознавание номера на parking-gate ИЛИ QR-скан охранником на паркинге
 			var guestEntries int
 			_ = s.db.QueryRow(ctx, `
 				SELECT COUNT(*)
 				FROM barrier_events
-				WHERE plate_number = $1
-				  AND direction    = 'IN'
-				  AND status       = 'OPENED'
-				  AND created_at  > NOW() - INTERVAL '30 minutes'
-			`, guestCarNumber).Scan(&guestEntries)
+				WHERE (
+				    (plate_number = $1 AND gate_id = 'parking-gate')
+				    OR
+				    (guest_pass_id = $2 AND event_type = 'QR_SCAN_PARKING')
+				)
+				  AND direction = 'IN'
+				  AND status    = 'OPENED'
+				  AND created_at > NOW() - INTERVAL '30 minutes'
+			`, guestCarNumber, guestPassID).Scan(&guestEntries)
 
 			if guestEntries > 0 {
 				// Это наш гость — помечаем пропуск как использованный

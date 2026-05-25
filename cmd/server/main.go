@@ -147,6 +147,7 @@ func main() {
 		priv.PATCH("/service-requests/:id/take", srH.Take)
 		priv.POST("/service-requests/:id/photos", srH.UploadPhoto)
 		priv.POST("/admin/service-requests/:id/assign", srH.Assign)
+		priv.POST("/admin/service-requests/:id/resolve-appeal", srH.ResolveAppeal)
 
 		staffH := handler.NewStaffHandler(pool)
 		priv.GET("/admin/staff", staffH.List)
